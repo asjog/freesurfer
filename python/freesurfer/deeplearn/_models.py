@@ -226,10 +226,6 @@ def unet_model_2d(input_shape, num_filters, unet_depth, downsize_filters_factor=
                      kernel_initializer="he_normal", name=('conv3D_U_2_%d' % (level)))(conv)
         convs.append(BatchNormalization(name=('bnorm_U_2_%d' % (level)))(conv))
 
-    # conv = ZeroPadding3D(padding=(1, 1, 1))(convs[-1])
-    # conv = Conv3D(num_filters * 2, (3, 3, 3), padding="valid", activation="relu", kernel_initializer="he_normal")(conv)
-    # conv = BatchNormalization()(conv)
-    # center_input = Cropping3D(cropping=(0, 0, 0))(input_img)
 
     inputs.append(input_img)
     # centered_inputs.append(center_input)

@@ -11,8 +11,10 @@ import scipy
 import random
 import sklearn
 import keras
-
-from .. import wm_peak_normalize, robust_normalize
+from keras.models import load_model
+from keras.callbacks import ReduceLROnPlateau, TensorBoard, ModelCheckpoint
+from keras import backend
+from .. import wm_peak_normalize, robust_normalize, wm_peak_normalize_t2w
 from . import *
 
 
@@ -87,35 +89,45 @@ class MRIDeepNetCallback(keras.callbacks.Callback):
 
 
 class MRIDeepNet(object):
-    def __init__(self, unet_num_filters, unet_depth, unet_downsampling_factor, feature_shape, dim=3,
+    def  __init__(self,  unet_num_filters, unet_depth, unet_downsampling_factor, feature_shape, depth_per_level=2, dim=3, kernel_size=(3,3,3),
                  storage_loc="memory", temp_folder=os.getcwd(), num_input_channels = 1, channel_names = ['t1w'],
-                 out_channel_names = ['trg'], n_labels=0, labels=[], net='unet', loss='mean_absolute_error',
-                 initial_learning_rate=0.00001, use_patches=True, wmp_standardize=True, rob_standardize=False,
+                 out_channel_names = ['seg'],
+                 n_labels=0, labels=[], net='unet', loss='mean_absolute_error',
+                 initial_learning_rate=0.00001, use_patches=True, wmp_standardize=True, rob_standardize=True,
                  fcn=True, num_gpus=1, preprocessing=False, augment=False, num_outputs=1,
-                 nmr_augment=False, use_tal=False, orientation='coronal'):
-
+                 nmr_augment=False, use_tal=True, rare_label_list=[], use_slices=False, orientation=None, add_modality_channel=False):
         self.net = net
         self.num_input_channels = num_input_channels
         self.channel_names = channel_names
         self.out_channel_names = out_channel_names
 
-        self.feature_shape = feature_shape  # should already include the num_input_channels (32,32,32,4)
+        self.feature_shape = feature_shape # should already include the num_input_channels (32,32,32,4)
         self.storage_loc = storage_loc
         self.temp_folder = temp_folder
         self.wmp_standardize = wmp_standardize
-        self.rob_standardize = rob_standardize
-
-        self.fcn = fcn  # fully convolutional or not boolean
+        self.rob_standardize = rob_standardize,
+        self.fcn = fcn # fully convolutional or not boolean
         self.num_gpus = num_gpus
         self.preprocessing = preprocessing
         self.augment = augment
         self.nmr_augment = nmr_augment
         self.use_tal = use_tal
+        self.rare_label_list = rare_label_list
+
 
         self.dim = len(feature_shape) - 1
         self.num_outputs = num_outputs
 
         self.orientation = orientation
+        self.kernel_size = kernel_size
+        self.depth_per_level = depth_per_level
+
+        self.use_slices = use_slices
+        self.add_modality_channel = add_modality_channel
+
+
+
+
 
         if net == 'unet':
             self.unet_downsampling_factor = unet_downsampling_factor
@@ -129,13 +141,16 @@ class MRIDeepNet(object):
             self.unet_downsampling_factor = unet_downsampling_factor
             self.unet_num_filters = unet_num_filters
             self.unet_depth = unet_depth
-            self.model, self.parallel_model = resnet_model(feature_shape, num_filters=unet_num_filters,
+            self.model, self.parallel_model = unet_model(feature_shape, num_filters=unet_num_filters,
                                                             unet_depth=unet_depth,
                                                             downsize_filters_factor=unet_downsampling_factor,
-                                                            pool_size=(2, 2, 2), n_labels=n_labels, loss=loss,
+                                                            pool_size=(2, 2, 2),
+                                                            n_labels=n_labels, loss=loss,
                                                             initial_learning_rate=initial_learning_rate,
                                                             deconvolution=False, use_patches=use_patches,
                                                             num_gpus=num_gpus)
+
+
         elif net == 'atrousnet':
             self.model = atrous_net(feature_shape, unet_num_filters, initial_learning_rate=initial_learning_rate,
                                     loss='mean_absolute_error')
@@ -151,12 +166,10 @@ class MRIDeepNet(object):
                                        downsize_filters_factor=unet_downsampling_factor, pool_size=(2, 2),
                                        n_labels=n_labels,loss=loss, initial_learning_rate=initial_learning_rate,
                                        deconvolution=False, use_patches=use_patches, num_gpus=num_gpus, num_outputs=num_outputs)
-        elif net == 'unet_2d_v1':
-            self.model, self.parallel_model = unet_2d_v1(input_shape=feature_shape, num_filters=unet_num_filters,
-                                                         unet_depth=unet_depth, downsize_filters_factor=unet_downsampling_factor,
-                                                         pool_size=(2,2), n_labels=n_labels, loss=loss,
-                                                         initial_learning_rate=initial_learning_rate,
-                                                         deconvolution=False, num_gpus=num_gpus, num_outputs=num_outputs)
+
+
+
+
         self.model_trained = False
         self.model_compiled = False
         self.labels = labels
@@ -164,27 +177,38 @@ class MRIDeepNet(object):
         self.feature_generator = FeatureGenerator(self.feature_shape, temp_folder=temp_folder,
                                                   storage_loc=storage_loc, labels=labels, n_labels=n_labels,
                                                   wmp_standardize=wmp_standardize, rob_standardize=rob_standardize,
-                                                  use_patches=use_patches, dim=self.dim,
+                                                  use_patches=use_patches, dim=dim,
                                                   preprocessing=self.preprocessing, augment=augment, nmr_augment=nmr_augment,
-                                                  num_outputs=self.num_outputs,
-                                                  num_input_channels=self.num_input_channels, channel_names=self.channel_names,
-                                                  out_channel_names=self.out_channel_names,
-                                                  use_tal = self.use_tal, orientation=orientation,)
-        self._weight_file = None
+                                                  num_outputs=num_outputs,
+                                                  num_input_channels=num_input_channels, channel_names=channel_names,
+                                                  out_channel_names=out_channel_names,
+                                                  use_tal = use_tal,
+                                                  rare_label_list = rare_label_list,
+                                                  orientation = orientation,
+                                                  use_slices = use_slices,
 
+                                                 )
+        self._weight_file = None
 
     @classmethod
     def from_file(cls, model_filename, loss, storage_loc='memory', temp_folder=os.getcwd(),
-                  net='unet', n_labels=0, labels=[], wmp_standardize=True, rob_standardize=False):
-        print(loss)
+                  net='unet', n_labels=0, labels=[],num_input_channels = 1, channel_names = ['t1w'],
+                  out_channel_names = ['seg'],initial_learning_rate=0.00001, use_patches=True,
+                  wmp_standardize=True, rob_standardize=True,fcn=True, num_gpus=1,
+                  preprocessing=False, augment=False, num_outputs=1,
+                  nmr_augment=False, use_tal=True, rare_label_list=[], use_slices=False,
+                  add_modality_channel=False,
+
+                  ):
+        print loss
         if loss == 'dice_coef_loss':
-            model = keras.load_model(model_filename,custom_objects={'dice_coef_loss': dice_coef_loss})
+            model = load_model(model_filename,custom_objects={'dice_coef_loss': dice_coef_loss})
         elif loss == 'dice_coef_loss2':
-            model = keras.load_model(model_filename, custom_objects={'dice_coef_loss2': dice_coef_loss2})
+            model = load_model(model_filename, custom_objects={'dice_coef_loss2': dice_coef_loss2})
         elif loss == 'grad_loss':
-            model = keras.load_model(model_filename, custom_objects={'grad_loss': grad_loss})
+            model = load_model(model_filename, custom_objects={'grad_loss': grad_loss})
         else:
-            model = keras.load_model(model_filename)
+            model = load_model(model_filename)
 
         input_shape = model.input_shape
         layer_list = model.get_config()["layers"]
@@ -193,39 +217,45 @@ class MRIDeepNet(object):
         unet_loss = model.loss
         dim = len(input_shape) - 2
 
+        kernel_size  = layer_list[1]['config']['kernel_size']
+
+        depth_per_level=0
+        for iter in range(len(layer_list)):
+            layer_name = layer_list[iter]['class_name']
+            if 'Conv' in layer_name:
+                depth_per_level = depth_per_level + 1
+            elif 'Pool' in layer_name:
+                break
+
+
         num_pools = 0
         for layer in layer_list:
-            if ((layer['class_name'] == 'MaxPooling3D') | ((layer['class_name'] == 'MaxPooling2D'))):
+            if ((layer['class_name'] == 'MaxPooling3D') | ((layer['class_name'] == 'MaxPooling2D'))) :
                 num_pools = num_pools + 1
 
-        unet_depth = 2 * num_pools - 1
+        unet_depth =  num_pools + 1 #2 * num_pools - 1
+        print(unet_depth)
 
         feature_shape = tuple(input_shape[1:])
 
         if net=='unet':
+
             cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth,
                        unet_downsampling_factor=unet_downsampling_factor,
                        feature_shape=feature_shape, loss=loss, storage_loc=storage_loc,
                         n_labels=n_labels,labels=labels,
                         temp_folder=temp_folder, net='unet',
-                           wmp_standardize=wmp_standardize, rob_standardize=rob_standardize)
+                           num_input_channels=num_input_channels, channel_names=channel_names,
+                           out_channel_names=out_channel_names, initial_learning_rate=initial_learning_rate, use_patches=use_patches,
+                           wmp_standardize=wmp_standardize, rob_standardize=rob_standardize, fcn=fcn, num_gpus=1,
+                           preprocessing=preprocessing, augment=augment, num_outputs=num_outputs,
+                           nmr_augment=nmr_augment, use_tal=use_tal, rare_label_list=[]
+
+                           )
             cls_init.model = model
             cls_init.model_trained = True
             cls_init.model_compiled = True
             print('Loaded model file: %s' % model_filename)
-
-        elif net =='unet_2d_v1':
-            cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth,
-                           unet_downsampling_factor=unet_downsampling_factor,
-                           feature_shape=feature_shape, loss=loss, storage_loc=storage_loc,
-                           n_labels=n_labels, labels=labels,
-                           temp_folder=temp_folder, net='unet_2d_v1',
-                           wmp_standardize=wmp_standardize, rob_standardize=rob_standardize)
-            cls_init.model = model
-            cls_init.model_trained = True
-            cls_init.model_compiled = True
-            print('Loaded model file: %s' % model_filename)
-
         elif net=='atrousnet':
             cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth,
                        unet_downsampling_factor=unet_downsampling_factor,
@@ -234,7 +264,6 @@ class MRIDeepNet(object):
             cls_init.model_trained = True
             cls_init.model_compiled = True
             print('Loaded model file: %s' % model_filename)
-
         elif net == 'noisenet':
             cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth,
                            unet_downsampling_factor=unet_downsampling_factor,
@@ -243,17 +272,23 @@ class MRIDeepNet(object):
             cls_init.model = model
             cls_init.model_trained = True
             cls_init.model_compiled = True
-
-        elif net == 'resnet':
-            cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth,
-                       unet_downsampling_factor=unet_downsampling_factor,
-                       feature_shape=feature_shape, loss=loss, storage_loc=storage_loc,
-                       n_labels=n_labels,labels=labels, temp_folder=temp_folder, net='resnet')
+            print('Loaded model file: %s' % model_filename)
+        elif net == 'unet_2d_v1':
+            cls_init = cls(unet_num_filters=unet_num_filters, unet_depth=unet_depth, depth_per_level=depth_per_level,
+                           unet_downsampling_factor=unet_downsampling_factor, kernel_size=kernel_size,
+                           feature_shape=feature_shape, loss=loss, storage_loc=storage_loc,
+                           n_labels=n_labels, labels=labels,
+                           temp_folder=temp_folder, net='unet_2d_v1',
+                           wmp_standardize=wmp_standardize, rob_standardize=rob_standardize,
+                           use_tal=use_tal, use_slices=use_slices, use_patches=use_patches,
+                           add_modality_channel=add_modality_channel)
             cls_init.model = model
             cls_init.model_trained = True
             cls_init.model_compiled = True
-
             print('Loaded model file: %s' % model_filename)
+
+
+
 
         return cls_init
 
@@ -341,14 +376,15 @@ class MRIDeepNet(object):
 
 
     def train_network(self, output_prefix, epochs=5, initial_epoch=1, batch_size=64, steps_per_epoch=10000, validation_steps=1000,
-                    optimizer='adam', save_per_epoch=False, save_weights=True, finetune=False):
-        print('Beginning Training. Using %s backend with "%s" data format.' % (keras.backend.backend(),
-                                                                               keras.backend.image_data_format()))
+                    optimizer='adam', save_per_epoch=False, save_weights=True, finetune=False, focus='ALL'):
+        print('Beginning Training. Using %s backend with "%s" data format.' % (backend.backend(),
+                                                                               backend.image_data_format()))
         if self._weight_file is not None:
             self.model.load_weights(self._weight_file)
 
-        reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5 ,patience=5, min_lr=0.000001)
-        # modelcp = keras.callbacks.ModelCheckpoint(output_prefix, monitor='val_loss', verbose=0, save_best_only=False, save_weights_only=False, mode='auto', period=1)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5 ,patience=5, min_lr=0.000001)
+        # modelcp = ModelCheckpoint(output_prefix, monitor='val_loss', verbose=0, save_best_only=False,
+        #                                 save_weights_only=False, mode='auto', period=1)
 
         print('Training model...')
         if self.n_labels == 0:
@@ -375,6 +411,7 @@ class MRIDeepNet(object):
                             validation_steps=validation_steps,
                             steps_per_epoch=steps_per_epoch,
                             callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+
                     elif out_channel_name == 't2beta':
                         self.model.fit_generator(
                             generator=self.feature_generator.training_generator_t2beta(
@@ -385,6 +422,7 @@ class MRIDeepNet(object):
                             validation_steps=validation_steps,
                             steps_per_epoch=steps_per_epoch,
                             callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+
                     else:
                         self.model.fit_generator(generator=self.feature_generator.training_generator(batch_size=batch_size*self.num_gpus),
                                          epochs=epochs,
@@ -395,6 +433,7 @@ class MRIDeepNet(object):
                 self.model_trained = True
             else:
                 callback = MultiGPUCheckpointCallback(output_prefix, save_per_epoch, save_weights, initial_epoch)
+
                 self.parallel_model.fit_generator(
                     generator=self.feature_generator.training_generator(batch_size=batch_size * self.num_gpus),
                     epochs=epochs,
@@ -408,37 +447,62 @@ class MRIDeepNet(object):
             if self.num_gpus == 1:
                 callback = MRIDeepNetCallback(output_prefix, save_per_epoch, save_weights, initial_epoch)
                 if ((self.nmr_augment == True) & (self.use_tal == True)) :
-                    self.model.fit_generator(generator=self.feature_generator.seg_training_generator_multichannel_nmr(batch_size=batch_size*self.num_gpus),
-                                     epochs=epochs,
-                                     validation_data=self.feature_generator.seg_validation_generator_multichannel_nmr(batch_size=batch_size*self.num_gpus),
-                                     validation_steps=validation_steps,
-                                     steps_per_epoch=steps_per_epoch,
-                                     callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=10)
+                    # self.model.fit_generator(generator=self.feature_generator.seg_training_generator_multichannel_nmr_t2(batch_size=batch_size*self.num_gpus),
+                    #                  epochs=epochs,
+                    #                  validation_data=self.feature_generator.seg_validation_generator_multichannel_nmr(batch_size=batch_size*self.num_gpus),
+                    #                  validation_steps=validation_steps,
+                    #                  steps_per_epoch=steps_per_epoch,
+                    #                  callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=10)
+
+                    self.model.fit_generator(
+                        generator=self.feature_generator.dynamic_seg_training_generator_multichannel_nmr_t2(batch_size=batch_size * self.num_gpus,
+                                                                                                            focus=focus),
+                        epochs=epochs,
+                        validation_data=self.feature_generator.dynamic_seg_validation_generator_multichannel_nmr_t2(
+                            batch_size=batch_size * self.num_gpus),
+                        validation_steps=validation_steps,
+                        steps_per_epoch=steps_per_epoch,
+                        callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=10)
                 elif ((self.nmr_augment == True) & (self.use_tal == True) & (finetune == True)):
                     self.model.fit_generator(generator=self.feature_generator.seg_training_generator_multichannel_nmr_finetune(
                         batch_size=batch_size * self.num_gpus),
                                              epochs=epochs,
                                              steps_per_epoch=steps_per_epoch,
                                              callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=10)
-                elif ((self.nmr_augment == True) & (self.use_tal == False)):
-                    self.model.fit_generator(generator=self.feature_generator.seg_training_generator_singlechannel_nmr(
-                        batch_size=batch_size * self.num_gpus),
+
+                elif ((self.nmr_augment == True) & (self.use_tal == False) & (self.use_slices == False)):
+                    self.model.fit_generator(generator=self.feature_generator.dynamic_seg_training_generator_singlechannel_nmr(
+                        batch_size=batch_size * self.num_gpus, focus=focus),
                                              epochs=epochs,
-                                             validation_data=self.feature_generator.seg_validation_generator_singlechannel_nmr(
+                                             validation_data=self.feature_generator.dynamic_seg_validation_generator_singlechannel_nmr(
                                                  batch_size=batch_size * self.num_gpus),
                                              validation_steps=validation_steps,
                                              steps_per_epoch=steps_per_epoch,
                                              callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+
+
+                elif ((self.nmr_augment == True) & (self.use_tal == False) & (self.use_slices == True)):
+                    print('focus is ' + focus)
+                    self.model.fit_generator(generator=self.feature_generator.dynamic_seg_training_generator_singlechannel_nmr_slice(
+                        batch_size=batch_size * self.num_gpus, focus=focus),
+                                             epochs=epochs,
+                                             validation_data=self.feature_generator.dynamic_seg_validation_generator_singlechannel_nmr_slice(
+                                                 batch_size=batch_size * self.num_gpus),
+                                             validation_steps=validation_steps,
+                                             steps_per_epoch=steps_per_epoch,
+                                             callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+
+
+
                 elif ((self.nmr_augment == False) & (self.use_tal == False)):
-                    self.model.fit_generator(
-                        generator=self.feature_generator.seg_training_generator_singlechannel(
-                            batch_size=batch_size * self.num_gpus),
-                        epochs=epochs,
-                        validation_data=self.feature_generator.seg_validation_generator_singlechannel(
-                            batch_size=batch_size * self.num_gpus),
-                        validation_steps=validation_steps,
-                        steps_per_epoch=steps_per_epoch,
-                        callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+                    self.model.fit_generator(generator=self.feature_generator.dynamic_seg_training_generator_singlechannel(
+                        batch_size=batch_size * self.num_gpus),
+                                             epochs=epochs,
+                                             validation_data=self.feature_generator.dynamic_seg_validation_generator_singlechannel(
+                                                 batch_size=batch_size * self.num_gpus),
+                                             validation_steps=validation_steps,
+                                             steps_per_epoch=steps_per_epoch,
+                                             callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
                 else:
                     self.model.fit_generator(
                         generator=self.feature_generator.seg_training_generator_multichannel(batch_size=batch_size * self.num_gpus),
@@ -459,6 +523,8 @@ class MRIDeepNet(object):
                     callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
                 self.parallel_model_trained = True
 
+
+
         elif (self.n_labels > 1) & (self.fcn == False):
             self.model.fit_generator(generator=self.feature_generator.training_label_generator(batch_size=batch_size*self.num_gpus),
                                      epochs=epochs,
@@ -467,6 +533,7 @@ class MRIDeepNet(object):
                                      validation_steps=validation_steps,
                                      steps_per_epoch=steps_per_epoch,
                                      callbacks=[callback, reduce_lr, ], verbose=1, max_queue_size=100)
+
 
 
     def synthesize_image(self, in_img_file_list, channel_names, out_img_filename, step_size, scale_output=1):
@@ -731,12 +798,12 @@ class MRIDeepNet(object):
 
 class FeatureGenerator(object):
     def __init__(self, feature_shape, temp_folder, storage_loc, labels=None, n_labels=0,
-                 wmp_standardize=True, use_patches=False, dim=3, preprocessing=False, augment=True,
-                 nmr_augment=False, rob_standardize=False,
+                 wmp_standardize=True, rob_standardize=True, use_patches=False, dim=3, preprocessing=False, augment=True,
+                 nmr_augment=False,
                  prob_rot_augmentation=0.25, prob_int_augmentation=0.5, num_outputs=1,
                  num_input_channels=1, channel_names=['t1w'], out_channel_names=['trg'],
-                 input_normalization_key=['wmp'], output_normalization_key=None, use_tal=True,
-                 orientation='coronal'):
+                 input_normalization_key=['wmp'], output_normalization_key=None, use_tal=True, rare_label_list=None, use_slices=False,
+                 orientation=None):
 
         self.feature_shape = feature_shape
 
@@ -760,11 +827,53 @@ class FeatureGenerator(object):
         self.channel_names = channel_names
         self.out_channel_names = out_channel_names
         self.use_tal = use_tal
-
+        self.rare_label_list = rare_label_list
+        self.use_slices = use_slices
         self.orientation = orientation
 
-        self.input_normalization_key = input_normalization_key
-        self.output_normalization_key = output_normalization_key
+        # dicts to store images in memory
+        self.trg_image_dict = {}
+        self.trg_fg_indices_dict = {}
+        self.trg_fg_labels_dict = {}
+        self.trg_slice_indices_dict = {}
+
+
+
+
+
+        self.val_trg_image_dict = {}
+        self.val_trg_fg_indices_dict = {}
+        self.val_trg_fg_labels_dict = {}
+        self.val_trg_slice_indices_dict = {}
+
+
+        self.src_image_dict = {}
+        self.val_src_image_dict = {}
+
+
+        for ch in self.out_channel_names:
+            self.trg_image_dict[ch] = list()
+            self.val_trg_image_dict[ch] = list()
+
+
+            if self.use_slices == True:
+                self.trg_slice_indices_dict[ch] = list()
+                self.val_trg_slice_indices_dict[ch] = list()
+
+            else:
+                self.trg_fg_indices_dict[ch] = list()
+                self.trg_fg_labels_dict[ch] = list()
+                self.val_trg_fg_indices_dict[ch] = list()
+                self.val_trg_fg_labels_dict[ch] = list()
+
+
+        for ch in self.channel_names:
+            self.src_image_dict[ch] = list()
+            self.val_src_image_dict[ch] = list()
+
+
+
+
 
         if self.augment == True:
             self.prob_rot_augmentation = prob_rot_augmentation
@@ -775,16 +884,6 @@ class FeatureGenerator(object):
                                                        augment_cubic_transforms_dict['gemprage'],
                                                        augment_cubic_transforms_dict['sonatamecho']) )
 
-        if self.nmr_augment == True:
-            # load the flash, mprage parameters.
-            theta_flash1 = np.load('/autofs/space/mreuter/users/amod/deep_learn/data/GE14/ge14_flash_parameters.npy')
-            theta_flash2 = np.load('/autofs/space/mreuter/users/amod/deep_learn/data/ThreeScanners/trio_flash_parameters.npy')
-            self.theta_flash = np.vstack((theta_flash1, theta_flash2))
-
-
-            theta_mprage1 =  np.load('/autofs/space/mreuter/users/amod/deep_learn/data/ThreeScanners/threescanners_mprage_parameters.npy')
-            theta_mprage2 = np.load('/autofs/space/mreuter/users/amod/deep_learn/data/Siemens13/siemens13_mprage_parameters.npy')
-            self.theta_mprage = np.vstack((theta_mprage1, theta_mprage2))
 
         self.data_storage = None
         self.storage_filename = None
@@ -814,6 +913,190 @@ class FeatureGenerator(object):
     def close_data_storage(self):
         print('Closing file')
         self.data_storage.close()
+
+
+    def generate_src_trg_training_collection(self, source_filenames, target_filenames, is_src_label_img, is_trg_label_img,
+                                       target_label_list = None, step_size=None, rare_label_list = None,
+                                       ):
+        num_subjects = len(target_filenames[0])
+        num_source_channels = self.num_input_channels
+        num_target_channels = len(self.out_channel_names)
+
+
+        for ch_iter in range(num_target_channels):
+            for subj_iter in range(num_subjects):
+
+
+
+                trg_img = nib.load(target_filenames[ch_iter][subj_iter])
+                trg_img_data = trg_img.get_data()
+                trg_img_data = self.preprocess_image(trg_img_data, self.out_channel_names[ch_iter])
+
+                if self.use_slices == True:
+                    if self.orientation is None:
+                        print('orientation of slices is not specified')
+                        return
+                    elif self.orientation == 'coronal':
+                        slice_idxs = list()
+                        for sl_idx in range(0, trg_img_data.shape[2]):
+                            slice = trg_img_data[:,:,sl_idx]
+                            nz_idxs = np.argwhere(slice  > 0)
+                            if nz_idxs.shape[0] > 0:
+                                slice_idxs.append(sl_idx)
+
+
+                    slice_idxs = np.asarray(slice_idxs)
+                    trg_img_data = self.map_labels(trg_img_data, self.labels)
+                    curr_channel = self.out_channel_names[ch_iter]
+                    self.trg_image_dict[curr_channel].append(trg_img_data)
+                    self.trg_slice_indices_dict[curr_channel].append(slice_idxs)
+                    print(trg_img_data.shape)
+                    print(slice_idxs.shape)
+
+
+                else:
+
+                    if rare_label_list is None:
+                        fg_idxs = np.argwhere(trg_img_data > 0)
+                        trg_fg = trg_img_data[trg_img_data > 0].flatten()
+                        trg_fg = np.reshape(trg_fg, (trg_fg.shape[0], 1))
+                    else:
+                        print('rare label list is ' + str(rare_label_list))
+                        mask = np.isin(trg_img_data, rare_label_list)
+                        fg_idxs = np.argwhere(mask == True)
+                        trg_fg = trg_img_data[mask == True].flatten()
+                        trg_fg = np.reshape(trg_fg, (trg_fg.shape[0], 1))
+
+                    trg_img_data = self.map_labels(trg_img_data, self.labels)
+                    print(trg_img_data.shape)
+                    print(fg_idxs.shape)
+                    curr_channel = self.out_channel_names[ch_iter]
+                    self.trg_image_dict[curr_channel].append(trg_img_data)
+                    self.trg_fg_indices_dict[curr_channel].append(fg_idxs)
+                    self.trg_fg_labels_dict[curr_channel].append(trg_fg)
+
+
+
+
+        for ch_iter in range(num_source_channels):
+
+            curr_channel = self.channel_names[ch_iter]
+
+            for subj_iter in range(num_subjects):
+                src_img = nib.load(source_filenames[ch_iter][subj_iter])
+                src_img_data = src_img.get_data()
+                src_img_data = self.preprocess_image(src_img_data, channel_name=curr_channel)
+                self.src_image_dict[curr_channel].append(src_img_data)
+
+
+    def generate_src_trg_validation_collection(self, source_filenames, target_filenames, is_src_label_img,
+                                             is_trg_label_img,
+                                             target_label_list=None, step_size=None,
+                                             ):
+        num_subjects = len(target_filenames[0])
+        num_source_channels = self.num_input_channels
+        num_target_channels = len(self.out_channel_names)
+
+        for ch_iter in range(num_target_channels):
+
+            for subj_iter in range(num_subjects):
+                trg_img = nib.load(target_filenames[ch_iter][subj_iter])
+                trg_img_data = trg_img.get_data()
+                trg_img_data = self.preprocess_image(trg_img_data, self.out_channel_names[ch_iter])
+
+                if self.use_slices == True:
+                    if self.orientation is None:
+                        print('orientation of slices is not specified')
+                        return
+                    elif self.orientation == 'coronal':
+                        slice_idxs = np.asarray(range(0, trg_img_data.shape[2]))
+
+
+                    trg_img_data = self.map_labels(trg_img_data, self.labels)
+                    curr_channel = self.out_channel_names[ch_iter]
+                    self.val_trg_image_dict[curr_channel].append(trg_img_data)
+                    self.val_trg_slice_indices_dict[curr_channel].append(slice_idxs)
+                    print(trg_img_data.shape)
+                    print(slice_idxs.shape)
+
+                else:
+
+                    fg_idxs = np.argwhere(trg_img_data > 0)
+                    trg_fg = trg_img_data[trg_img_data > 0].flatten()
+                    trg_fg = np.reshape(trg_fg, (trg_fg.shape[0], 1))
+
+                    print(trg_img_data.shape)
+                    print(fg_idxs.shape)
+                    curr_channel = self.out_channel_names[ch_iter]
+                    self.val_trg_image_dict[curr_channel].append(trg_img_data)
+                    self.val_trg_fg_indices_dict[curr_channel].append(fg_idxs)
+                    self.val_trg_fg_labels_dict[curr_channel].append(trg_fg)
+
+        for ch_iter in range(num_source_channels):
+
+            curr_channel = self.channel_names[ch_iter]
+
+            for subj_iter in range(num_subjects):
+                src_img = nib.load(source_filenames[ch_iter][subj_iter])
+                src_img_data = src_img.get_data()
+                src_img_data = self.preprocess_image(src_img_data, channel_name=curr_channel)
+                self.val_src_image_dict[curr_channel].append(src_img_data)
+
+
+
+    def preprocess_image(self, in_img_data, channel_name):
+
+        pad_width = ((self.feature_shape[0], self.feature_shape[0]),
+                     (self.feature_shape[1], self.feature_shape[1]),
+                     (self.feature_shape[2], self.feature_shape[2]))
+        if self.use_slices == False:
+            in_img_data = np.pad(in_img_data, pad_width, 'constant')
+
+        if 'seg' in channel_name:
+            # in_img_data = self.map_labels(in_img_data,self.labels )
+            print('processing label image, do not do anything')
+
+        else:
+
+            in_img_data = in_img_data.astype(float)
+
+
+
+            if 't1w' in  channel_name:
+                # it is a t1w image.
+                if self.wmp_standardize == True:
+                    if self.rob_standardize == True:
+                        print('robnorm True wmp true')
+
+                        in_img_data = robust_normalize(in_img_data)
+                        in_img_data = wm_peak_normalize((in_img_data))
+
+                    else:
+                        print('robnorm False wmp true')
+                        in_img_data = wm_peak_normalize((in_img_data))
+                else:
+                    print('robnorm true, wmp false')
+                    in_img_data = robust_normalize(in_img_data)
+
+                in_img_data[in_img_data > 255] = 255
+                in_img_data = in_img_data / 255
+
+            elif 't2w' in channel_name:
+                # if self.wmp_standardize == True:
+                #     in_img_data = intensity_standardize_utils.wm_peak_normalize_t2w(in_img_data)
+                # else:
+                in_img_data = wm_peak_normalize_t2w(in_img_data)
+
+                # in_img_data[in_img_data > 255] = 255
+                # in_img_data = in_img_data / 255
+                # in_img_data[in_img_data > 1.2] = 1.2
+            elif 'tal' in channel_name:
+                # this channel has atlas coordinates
+                print('channel name ' + channel_name)
+                in_img_data = in_img_data/127
+            else:
+                in_img_data = in_img_data
+        return in_img_data
 
 
     def create_rare_training_feature_array(self, src_filenames, src_array_name, trg_filenames, trg_array_name,
@@ -1549,6 +1832,115 @@ class FeatureGenerator(object):
         val_index_array.append(val_indices)
 
         return feature_array, index_array, indices
+
+
+    def dynamic_seg_training_generator_singlechannel(self, batch_size):
+        while True:
+            x_list = list()
+            y_list = list()
+            trg_channel_name = self.out_channel_names[0]
+            img_index_list = range(len(self.trg_image_dict[trg_channel_name]))
+            #   list(range(self.data_storage.root.trgseg.shape[0]))
+
+            # Randomly generate batch_size of subject_ids.
+            num_subjects = len(img_index_list)
+            subj_idxs = np.random.choice(range(0, num_subjects), batch_size)
+            batch_index_list = list()
+            for subj_idx in subj_idxs:
+                p_idxs = random.sample(xrange(len(self.trg_fg_indices_dict[trg_channel_name][subj_idx])), 1)
+                for p_idx in p_idxs:
+                    [px, py, pz] = self.trg_fg_indices_dict[trg_channel_name][subj_idx][p_idx]
+                    batch_index_list.append([subj_idx, px, py, pz])
+
+            batch_index_array = np.array(batch_index_list)
+            num_orig_mprage = (batch_size)
+
+
+            orig_mprage_idxs = range(0, num_orig_mprage)
+
+
+            orig_mprage_batch_idxs = batch_index_array[orig_mprage_idxs]
+
+
+
+
+            for b_iter in range(orig_mprage_batch_idxs.shape[0]):
+
+                subj_iter = orig_mprage_batch_idxs[b_iter][0]
+                px = orig_mprage_batch_idxs[b_iter][1]
+                py = orig_mprage_batch_idxs[b_iter][2]
+                pz = orig_mprage_batch_idxs[b_iter][3]
+                x_t1w_patch = self.src_image_dict['t1w'][subj_iter][
+                              int(px) - self.feature_shape[0] / 2: int(px) + self.feature_shape[0] / 2,
+                              int(py) - self.feature_shape[1] / 2: int(py) + self.feature_shape[1] / 2,
+                              int(pz) - self.feature_shape[2] / 2:int(pz) + self.feature_shape[2] / 2]
+
+
+                y_patch = self.trg_image_dict['seg'][subj_iter][
+                          int(px) - self.feature_shape[0] / 2: int(px) + self.feature_shape[0] / 2,
+                          int(py) - self.feature_shape[1] / 2: int(py) + self.feature_shape[1] / 2,
+                          int(pz) - self.feature_shape[2] / 2:int(pz) + self.feature_shape[2] / 2]
+                x_list.append(x_t1w_patch)
+                y_list.append(y_patch)
+
+
+
+            x_array = np.stack(x_list, axis=0)
+            y_array = np.stack(y_list, axis=0)
+            x_array =  np.reshape(x_array, x_array.shape + (1,))
+            y_array =  np.reshape(y_array, y_array.shape + (1,))
+            x, y = self.convert_data(x_array, y_array, self.n_labels, self.labels)
+
+            yield x, y
+
+
+
+    def dynamic_seg_validation_generator_singlechannel(self, batch_size):
+        while True:
+            x_list = list()
+            y_list = list()
+            trg_channel_name = self.out_channel_names[0]
+            img_index_list = range(len(self.val_trg_image_dict[trg_channel_name]))
+            #   list(range(self.data_storage.root.trgseg.shape[0]))
+
+            # Randomly generate batch_size of subject_ids.
+            num_subjects = len(img_index_list)
+            subj_idxs = np.random.choice(range(0, num_subjects), batch_size)
+            batch_index_list = list()
+            for subj_idx in subj_idxs:
+                p_idxs = random.sample(xrange(len(self.val_trg_fg_indices_dict[trg_channel_name][subj_idx])), 1)
+                for p_idx in p_idxs:
+                    [px, py, pz] = self.val_trg_fg_indices_dict[trg_channel_name][subj_idx][p_idx]
+                    batch_index_list.append([subj_idx, px, py, pz])
+
+
+            for b_index in batch_index_list:
+                subj_iter = b_index[0]
+                px = b_index[1]
+                py = b_index[2]
+                pz = b_index[3]
+                x_t1w_patch = self.val_src_image_dict['t1w'][subj_iter][
+                              int(px) - self.feature_shape[0] / 2: int(px) + self.feature_shape[0] / 2,
+                              int(py) - self.feature_shape[1] / 2: int(py) + self.feature_shape[1] / 2,
+                              int(pz) - self.feature_shape[2] / 2:int(pz) + self.feature_shape[2] / 2]
+
+                y_patch = self.val_trg_image_dict['seg'][subj_iter][
+                          int(px) - self.feature_shape[0] / 2: int(px) + self.feature_shape[0] / 2,
+                          int(py) - self.feature_shape[1] / 2: int(py) + self.feature_shape[1] / 2,
+                          int(pz) - self.feature_shape[2] / 2:int(pz) + self.feature_shape[2] / 2]
+                x_list.append(x_t1w_patch)
+                y_list.append(y_patch)
+
+
+
+            x_array = np.stack(x_list, axis=0)
+            y_array = np.stack(y_list, axis=0)
+            x_array =  np.reshape(x_array, x_array.shape + (1,))
+            y_array =  np.reshape(y_array, y_array.shape + (1,))
+            x, y = self.convert_data(x_array, y_array, self.n_labels, self.labels)
+
+            yield x, y
+
 
 
     def training_generator(self, batch_size):
